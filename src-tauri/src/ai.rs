@@ -33,8 +33,11 @@ impl Default for AiState {
 
 impl AiState {
     pub fn new() -> Self {
+        // No client-wide `.timeout()`: reqwest applies it to the whole response
+        // body, which would cut off any answer that takes longer than 30s to
+        // stream. Waiting is bounded instead by the 30s timeout on the initial
+        // response and the 30s *inactivity* timeout between chunks.
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -273,6 +276,31 @@ pub async fn execute_stream(
     on_event: Channel<String>,
     cancel_token: CancellationToken,
 ) -> Result<(), String> {
+    execute_stream_with_timeout(
+        client,
+        base_endpoint,
+        model,
+        prompt,
+        context,
+        on_event,
+        cancel_token,
+        Duration::from_secs(TIMEOUT_SECS),
+    )
+    .await
+}
+
+/// [`execute_stream`] with a configurable chunk-inactivity timeout (for tests).
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_stream_with_timeout(
+    client: reqwest::Client,
+    base_endpoint: String,
+    model: String,
+    prompt: String,
+    context: Option<String>,
+    on_event: Channel<String>,
+    cancel_token: CancellationToken,
+    chunk_timeout: Duration,
+) -> Result<(), String> {
     let chat_url = resolve_chat_url(&base_endpoint);
 
     let mut messages = Vec::new();
@@ -334,7 +362,6 @@ pub async fn execute_stream(
 
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
-    let chunk_timeout = Duration::from_secs(TIMEOUT_SECS);
 
     loop {
         tokio::select! {
@@ -379,10 +406,10 @@ pub async fn execute_stream(
                         break;
                     }
                     Err(_) => {
-                        // 30s chunk inactivity timeout
+                        // Chunk inactivity timeout (30s in production)
                         return Err(format!(
-                            "AI server response timed out ({}s inactivity during streaming)",
-                            TIMEOUT_SECS
+                            "AI server response timed out ({:?} inactivity during streaming)",
+                            chunk_timeout
                         ));
                     }
                 }
@@ -589,5 +616,201 @@ mod tests {
         let restarted = AiState::new();
         restarted.load_from_settings(&conn).unwrap();
         assert_eq!(restarted.get_endpoint(), DEFAULT_OLLAMA_ENDPOINT);
+    }
+
+    // ---- Streaming tests against a local fake SSE server -------------------
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    /// Minimal HTTP/1.1 server that streams `chunks` SSE tokens, one every
+    /// `interval`, then finishes. It tracks open connections
+    /// and reports when the client has gone away (a write fails).
+    struct FakeSse {
+        base_url: String,
+        open_connections: Arc<AtomicUsize>,
+        closed_by_client: mpsc::Receiver<()>,
+    }
+
+    fn spawn_fake_sse(chunks: usize, interval: Duration) -> FakeSse {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let open = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+        let open_srv = open.clone();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            open_srv.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 8192];
+            let mut req = Vec::new();
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+            }
+            let closed = |open: &AtomicUsize| {
+                open.fetch_sub(1, Ordering::SeqCst);
+                let _ = tx.send(());
+            };
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            if sock.write_all(head.as_bytes()).is_err() {
+                return closed(&open_srv);
+            }
+            for i in 0..chunks {
+                let event =
+                    format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"t{i}\"}}}}]}}\n\n");
+                let frame = format!("{:x}\r\n{}\r\n", event.len(), event);
+                if sock.write_all(frame.as_bytes()).and_then(|_| sock.flush()).is_err() {
+                    return closed(&open_srv);
+                }
+                std::thread::sleep(interval);
+            }
+            let _ = sock.write_all(b"0\r\n\r\n");
+            open_srv.fetch_sub(1, Ordering::SeqCst);
+        });
+        FakeSse { base_url, open_connections: open, closed_by_client: rx }
+    }
+
+    fn collecting_channel() -> (Channel<String>, Arc<Mutex<Vec<String>>>) {
+        let tokens = Arc::new(Mutex::new(Vec::new()));
+        let sink = tokens.clone();
+        let channel = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                sink.lock().unwrap().push(json);
+            }
+            Ok(())
+        });
+        (channel, tokens)
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    #[test]
+    fn test_cancel_mid_stream_closes_socket() {
+        let server = spawn_fake_sse(1_000, Duration::from_millis(20));
+        let (channel, tokens) = collecting_channel();
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        let started = std::time::Instant::now();
+
+        let result = runtime().block_on(async {
+            let watcher = {
+                let tokens = tokens.clone();
+                async move {
+                    while tokens.lock().unwrap().len() < 3 {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    canceller.cancel(); // what cancel_ai_stream does
+                }
+            };
+            let stream = execute_stream(
+                AiState::new().client,
+                server.base_url.clone(),
+                "m".into(),
+                "p".into(),
+                None,
+                channel,
+                token,
+            );
+            let (res, _) = tokio::join!(stream, watcher);
+            res
+        });
+
+        assert_eq!(result, Ok(()));
+        let received = tokens.lock().unwrap().len();
+        assert!((3..1_000).contains(&received), "stopped early, got {received} tokens");
+        server
+            .closed_by_client
+            .recv_timeout(Duration::from_secs(3))
+            .expect("server must see the connection closed after cancel");
+        assert_eq!(server.open_connections.load(Ordering::SeqCst), 0, "socket reclaimed");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_closed_channel_stops_stream_and_closes_socket() {
+        let server = spawn_fake_sse(1_000, Duration::from_millis(20));
+        let sent = Arc::new(AtomicUsize::new(0));
+        let sent_cb = sent.clone();
+        // The frontend closed the panel: delivery fails after the 2nd token.
+        let channel: Channel<String> = Channel::new(move |_| {
+            if sent_cb.fetch_add(1, Ordering::SeqCst) >= 2 {
+                Err(tauri::Error::WebviewNotFound)
+            } else {
+                Ok(())
+            }
+        });
+        let token = CancellationToken::new();
+        let result = runtime().block_on(execute_stream(
+            AiState::new().client,
+            server.base_url.clone(),
+            "m".into(),
+            "p".into(),
+            None,
+            channel,
+            token.clone(),
+        ));
+        assert_eq!(result, Ok(()));
+        assert!(token.is_cancelled());
+        server
+            .closed_by_client
+            .recv_timeout(Duration::from_secs(3))
+            .expect("server must see the connection closed");
+        assert_eq!(server.open_connections.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_inactivity_timeout_not_total_duration() {
+        // 30 tokens x 50ms = ~1.5s total, far longer than the 300ms inactivity
+        // limit: a steady stream must finish, because only silence times out.
+        let server = spawn_fake_sse(30, Duration::from_millis(50));
+        let (channel, tokens) = collecting_channel();
+        let result = runtime().block_on(execute_stream_with_timeout(
+            AiState::new().client,
+            server.base_url.clone(),
+            "m".into(),
+            "p".into(),
+            None,
+            channel,
+            CancellationToken::new(),
+            Duration::from_millis(300),
+        ));
+        assert_eq!(result, Ok(()));
+        assert_eq!(tokens.lock().unwrap().len(), 30);
+
+        // A server that stops sending after 2 tokens must time out quickly.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            let ev = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
+            let frame = format!("{:x}\r\n{}\r\n", ev.len(), ev);
+            let _ = sock.write_all(
+                format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{frame}{frame}").as_bytes(),
+            );
+            std::thread::sleep(Duration::from_secs(3)); // silence
+        });
+        let (channel, _) = collecting_channel();
+        let started = std::time::Instant::now();
+        let result = runtime().block_on(execute_stream_with_timeout(
+            AiState::new().client,
+            base_url,
+            "m".into(),
+            "p".into(),
+            None,
+            channel,
+            CancellationToken::new(),
+            Duration::from_millis(300),
+        ));
+        assert!(result.unwrap_err().contains("inactivity"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

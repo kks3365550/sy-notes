@@ -101,13 +101,44 @@ fn restore_doc(
     doc::restore_doc(&conn, &id).map_err(|e| e.to_string())
 }
 
+/// Result of a trash purge: documents deleted and attachment files removed.
+#[derive(Debug, serde::Serialize)]
+pub struct PurgeReport {
+    pub purged_docs: usize,
+    pub removed_attachments: usize,
+}
+
+/// Purges the trash, then removes attachment files no document references.
+pub fn purge_and_clean(
+    conn: &rusqlite::Connection,
+    data_dir: &Path,
+    older_than_days: Option<u32>,
+) -> Result<PurgeReport, String> {
+    let purged_docs = doc::purge_trash(conn, older_than_days).map_err(|e| e.to_string())?;
+    let removed_attachments =
+        attachment::cleanup_orphan_attachments(conn, data_dir, attachment::ORPHAN_GRACE)?
+            .removed
+            .len();
+    Ok(PurgeReport {
+        purged_docs,
+        removed_attachments,
+    })
+}
+
+fn data_dir() -> PathBuf {
+    let db_path = db::get_default_db_path();
+    db_path.parent().unwrap_or(Path::new("data")).to_path_buf()
+}
+
+/// `older_than_days`: omitted/null empties the whole trash (UI asks for
+/// confirmation first); a number only purges documents trashed longer ago.
 #[tauri::command]
 fn purge_trash(
-    older_than_days: Option<i64>,
+    older_than_days: Option<u32>,
     state: tauri::State<'_, db::DbPool>,
-) -> Result<usize, String> {
+) -> Result<PurgeReport, String> {
     let conn = state.get().map_err(|e| e.to_string())?;
-    doc::purge_trash(&conn, older_than_days.unwrap_or(30)).map_err(|e| e.to_string())
+    purge_and_clean(&conn, &data_dir(), older_than_days)
 }
 
 #[tauri::command]
@@ -183,6 +214,18 @@ pub fn run() {
     let db_path = db::get_default_db_path();
     let pool = db::create_pool(&db_path).expect("Failed to initialize SQLite connection pool");
     db::init_pool(&pool).expect("Failed to run database migrations");
+
+    // Automatic cleanup off the startup path: trash older than 30 days and
+    // orphaned attachment files.
+    {
+        let pool = pool.clone();
+        std::thread::spawn(move || {
+            let Ok(conn) = pool.get() else { return };
+            if let Err(e) = purge_and_clean(&conn, &data_dir(), Some(doc::TRASH_RETENTION_DAYS)) {
+                eprintln!("[sy-notes] automatic trash cleanup failed: {e}");
+            }
+        });
+    }
 
     let ai_state = ai::AiState::new();
     // Restore the user's AI server settings (falls back to local Ollama).

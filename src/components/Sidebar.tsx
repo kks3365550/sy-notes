@@ -214,10 +214,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
     setActionLoadingId("purge");
     try {
-      await purgeTrash(0);
+      await purgeTrash(null);
       await loadDocuments();
     } catch (err) {
       console.error("Failed to purge trash:", err);
+      window.alert(`휴지통 비우기에 실패했습니다: ${String(err)}`);
     } finally {
       setActionLoadingId(null);
     }

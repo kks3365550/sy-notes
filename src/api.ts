@@ -90,13 +90,19 @@ export async function restoreDoc(id: string): Promise<void> {
   }
 }
 
-export async function purgeTrash(olderThanDays = 30): Promise<number> {
-  try {
-    return await invoke<number>("purge_trash", { olderThanDays });
-  } catch (err) {
-    console.warn("invoke purge_trash fallback:", err);
-    return 0;
-  }
+export interface PurgeReport {
+  purged_docs: number;
+  removed_attachments: number;
+}
+
+/**
+ * Permanently deletes trashed documents and unreferenced attachment files.
+ * `olderThanDays = null` empties the whole trash (confirm with the user first);
+ * a number only removes documents trashed longer ago than that.
+ * Rejects on failure so the UI can report it.
+ */
+export async function purgeTrash(olderThanDays: number | null = null): Promise<PurgeReport> {
+  return await invoke<PurgeReport>("purge_trash", { olderThanDays });
 }
 
 export async function listDocs(includeDeleted = false): Promise<DocumentItem[]> {

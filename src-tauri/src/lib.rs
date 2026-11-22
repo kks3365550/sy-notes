@@ -132,14 +132,17 @@ fn get_storage_info() -> db::StorageInfo {
     db::get_storage_info()
 }
 
+/// Data directory resolved once at startup (portable `data/` or the %APPDATA% fallback),
+/// shared by attachment saving and the `attachment://` URI scheme so both always agree.
+struct DataDir(PathBuf);
+
 #[tauri::command]
 fn save_attachment(
     file_name: String,
     data_base64: String,
+    data_dir: tauri::State<'_, DataDir>,
 ) -> Result<String, String> {
-    let db_path = db::get_default_db_path();
-    let base_data_dir = db_path.parent().unwrap_or(Path::new("data"));
-    attachment::save_attachment_file(base_data_dir, &file_name, &data_base64)
+    attachment::save_attachment_file(&data_dir.0, &file_name, &data_base64)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -150,8 +153,21 @@ pub fn run() {
 
     let ai_state = ai::AiState::new();
 
+    let data_dir = db_path.parent().unwrap_or(Path::new("data")).to_path_buf();
+    let attachments_dir = attachment::attachments_dir(&data_dir);
+    let _ = std::fs::create_dir_all(&attachments_dir);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Serves `<data_dir>/attachments/<file>` at attachment://localhost/<file>
+        // (http://attachment.localhost/<file> on Windows/Android).
+        .register_asynchronous_uri_scheme_protocol(attachment::URI_SCHEME, move |_ctx, request, responder| {
+            let dir = attachments_dir.clone();
+            std::thread::spawn(move || {
+                responder.respond(attachment::build_attachment_response(&dir, &request));
+            });
+        })
+        .manage(DataDir(data_dir))
         .manage(pool)
         .manage(ai_state)
         .invoke_handler(tauri::generate_handler![

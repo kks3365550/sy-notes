@@ -9,6 +9,10 @@ use tokio_util::sync::CancellationToken;
 pub const DEFAULT_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434/v1";
 /// Default Ollama model name
 pub const DEFAULT_MODEL: &str = "qwen2.5:latest";
+/// `settings` table key for the OpenAI-compatible base URL (e.g. `http://127.0.0.1:11434/v1`).
+pub const SETTING_AI_BASE_URL: &str = "ai_base_url";
+/// `settings` table key for the model name.
+pub const SETTING_AI_MODEL: &str = "ai_model";
 /// Timeout for AI connection and stream chunk inactivity (30 seconds)
 pub const TIMEOUT_SECS: u64 = 30;
 
@@ -68,6 +72,91 @@ impl AiState {
             .map(|m| m.clone())
             .unwrap_or_else(|_| DEFAULT_MODEL.to_string())
     }
+
+    /// Loads the persisted endpoint/model from the `settings` table.
+    /// Missing or invalid values keep the defaults (Ollama on loopback).
+    pub fn load_from_settings(&self, conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+        if let Some(url) = get_setting(conn, SETTING_AI_BASE_URL)? {
+            if let Ok(valid) = validate_base_url(&url) {
+                self.set_endpoint(valid);
+            }
+        }
+        if let Some(model) = get_setting(conn, SETTING_AI_MODEL)? {
+            if let Ok(valid) = validate_model(&model) {
+                self.set_model(valid);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validates an OpenAI-compatible base URL: must be `http://` or `https://` with a host.
+pub fn validate_base_url(url: &str) -> Result<String, String> {
+    let trimmed = url.trim();
+    let rest = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .ok_or_else(|| "AI 서버 주소는 http:// 또는 https:// 로 시작해야 합니다".to_string())?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() || host.starts_with(':') || trimmed.chars().any(char::is_whitespace) {
+        return Err("AI 서버 주소에 호스트가 없습니다".to_string());
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+/// Validates a model name (non-empty, no whitespace-only).
+pub fn validate_model(model: &str) -> Result<String, String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Err("모델 이름이 비어 있습니다".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Reads a value from the `settings` key-value table.
+pub fn get_setting(conn: &rusqlite::Connection, key: &str) -> rusqlite::Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        rusqlite::params![key],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Upserts a value into the `settings` key-value table.
+pub fn set_setting(conn: &rusqlite::Connection, key: &str, value: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        rusqlite::params![key, value, chrono::Utc::now().timestamp_millis()],
+    )?;
+    Ok(())
+}
+
+/// Validates, persists, and applies a new AI configuration.
+/// Values are written to the DB first so memory never holds an unsaved setting.
+pub fn apply_ai_config(
+    conn: &rusqlite::Connection,
+    state: &AiState,
+    endpoint: Option<String>,
+    model: Option<String>,
+) -> Result<(), String> {
+    let endpoint = endpoint.map(|e| validate_base_url(&e)).transpose()?;
+    let model = model.map(|m| validate_model(&m)).transpose()?;
+    if let Some(ep) = &endpoint {
+        set_setting(conn, SETTING_AI_BASE_URL, ep).map_err(|e| e.to_string())?;
+    }
+    if let Some(m) = &model {
+        set_setting(conn, SETTING_AI_MODEL, m).map_err(|e| e.to_string())?;
+    }
+    if let Some(ep) = endpoint {
+        state.set_endpoint(ep);
+    }
+    if let Some(m) = model {
+        state.set_model(m);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -360,20 +449,17 @@ pub fn cancel_ai_stream(state: tauri::State<'_, AiState>) -> Result<(), String> 
     Ok(())
 }
 
-/// Tauri command to update AI settings (endpoint, model).
+/// Tauri command to update AI settings (endpoint, model). Persisted in `settings`
+/// so they survive restarts.
 #[tauri::command]
 pub fn set_ai_config(
     endpoint: Option<String>,
     model: Option<String>,
     state: tauri::State<'_, AiState>,
+    db: tauri::State<'_, crate::db::DbPool>,
 ) -> Result<(), String> {
-    if let Some(ep) = endpoint {
-        state.set_endpoint(ep);
-    }
-    if let Some(m) = model {
-        state.set_model(m);
-    }
-    Ok(())
+    let conn = db.get().map_err(|e| e.to_string())?;
+    apply_ai_config(&conn, &state, endpoint, model)
 }
 
 /// Tauri command to get current AI settings.
@@ -450,5 +536,58 @@ mod tests {
         assert!(!token.is_cancelled());
         cloned_token.cancel();
         assert!(token.is_cancelled());
+    }
+
+    fn settings_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_database(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_ai_config_persists_across_restart() {
+        let conn = settings_db();
+        let state = AiState::new();
+        apply_ai_config(
+            &conn,
+            &state,
+            Some(" http://192.168.0.20:8088/v1/ ".to_string()),
+            Some("bonsai2".to_string()),
+        )
+        .unwrap();
+        assert_eq!(state.get_endpoint(), "http://192.168.0.20:8088/v1");
+
+        // Simulated restart: fresh in-memory state, same DB.
+        let restarted = AiState::new();
+        assert_eq!(restarted.get_endpoint(), DEFAULT_OLLAMA_ENDPOINT);
+        restarted.load_from_settings(&conn).unwrap();
+        assert_eq!(restarted.get_endpoint(), "http://192.168.0.20:8088/v1");
+        assert_eq!(restarted.get_model(), "bonsai2");
+    }
+
+    #[test]
+    fn test_ai_config_defaults_and_validation() {
+        let conn = settings_db();
+        let state = AiState::new();
+        // Nothing stored: defaults to local Ollama.
+        state.load_from_settings(&conn).unwrap();
+        assert_eq!(state.get_endpoint(), DEFAULT_OLLAMA_ENDPOINT);
+
+        for bad in ["", "127.0.0.1:11434", "ftp://host/v1", "http://", "http://:8080", "http://a b/v1"] {
+            assert!(
+                apply_ai_config(&conn, &state, Some(bad.to_string()), None).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+        assert!(apply_ai_config(&conn, &state, None, Some("  ".to_string())).is_err());
+        // Rejected values are neither applied nor stored.
+        assert_eq!(state.get_endpoint(), DEFAULT_OLLAMA_ENDPOINT);
+        assert_eq!(get_setting(&conn, SETTING_AI_BASE_URL).unwrap(), None);
+
+        // A bad stored value (e.g. hand-edited DB) is ignored on load.
+        set_setting(&conn, SETTING_AI_BASE_URL, "not a url").unwrap();
+        let restarted = AiState::new();
+        restarted.load_from_settings(&conn).unwrap();
+        assert_eq!(restarted.get_endpoint(), DEFAULT_OLLAMA_ENDPOINT);
     }
 }

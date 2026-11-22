@@ -185,6 +185,15 @@ pub fn run() {
     db::init_pool(&pool).expect("Failed to run database migrations");
 
     let ai_state = ai::AiState::new();
+    // Restore the user's AI server settings (falls back to local Ollama).
+    match pool.get() {
+        Ok(conn) => {
+            if let Err(e) = ai_state.load_from_settings(&conn) {
+                eprintln!("[sy-notes] failed to load AI settings, using defaults: {e}");
+            }
+        }
+        Err(e) => eprintln!("[sy-notes] failed to load AI settings, using defaults: {e}"),
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

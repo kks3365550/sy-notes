@@ -146,3 +146,19 @@ export async function getStorageInfo(): Promise<StorageInfo> {
     };
   }
 }
+
+export interface AiConfig {
+  /** OpenAI-compatible base URL, e.g. http://127.0.0.1:11434/v1 */
+  endpoint: string;
+  model: string;
+}
+
+/** Reads the AI server settings (persisted in the `settings` table). */
+export async function getAiConfig(): Promise<AiConfig> {
+  return await invoke<AiConfig>("get_ai_config");
+}
+
+/** Validates and persists the AI server settings. Rejects with a message on invalid input. */
+export async function setAiConfig(config: Partial<AiConfig>): Promise<void> {
+  await invoke("set_ai_config", { endpoint: config.endpoint, model: config.model });
+}

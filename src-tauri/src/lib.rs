@@ -125,20 +125,16 @@ pub fn purge_and_clean(
     })
 }
 
-fn data_dir() -> PathBuf {
-    let db_path = db::get_default_db_path();
-    db_path.parent().unwrap_or(Path::new("data")).to_path_buf()
-}
-
 /// `older_than_days`: omitted/null empties the whole trash (UI asks for
 /// confirmation first); a number only purges documents trashed longer ago.
 #[tauri::command]
 fn purge_trash(
     older_than_days: Option<u32>,
     state: tauri::State<'_, db::DbPool>,
+    data_dir: tauri::State<'_, DataDir>,
 ) -> Result<PurgeReport, String> {
     let conn = state.get().map_err(|e| e.to_string())?;
-    purge_and_clean(&conn, &data_dir(), older_than_days)
+    purge_and_clean(&conn, &data_dir.0, older_than_days)
 }
 
 #[tauri::command]
@@ -199,14 +195,18 @@ fn get_storage_info() -> db::StorageInfo {
     db::get_storage_info()
 }
 
+/// Data directory resolved once at startup (portable `data/` or the %APPDATA% fallback),
+/// shared by attachment saving, orphan cleanup and the `attachment://` URI scheme so
+/// they always agree.
+struct DataDir(PathBuf);
+
 #[tauri::command]
 fn save_attachment(
     file_name: String,
     data_base64: String,
+    data_dir: tauri::State<'_, DataDir>,
 ) -> Result<String, String> {
-    let db_path = db::get_default_db_path();
-    let base_data_dir = db_path.parent().unwrap_or(Path::new("data"));
-    attachment::save_attachment_file(base_data_dir, &file_name, &data_base64)
+    attachment::save_attachment_file(&data_dir.0, &file_name, &data_base64)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -215,13 +215,18 @@ pub fn run() {
     let pool = db::create_pool(&db_path).expect("Failed to initialize SQLite connection pool");
     db::init_pool(&pool).expect("Failed to run database migrations");
 
+    let data_dir = db_path.parent().unwrap_or(Path::new("data")).to_path_buf();
+    let attachments_dir = attachment::attachments_dir(&data_dir);
+    let _ = std::fs::create_dir_all(&attachments_dir);
+
     // Automatic cleanup off the startup path: trash older than 30 days and
     // orphaned attachment files.
     {
         let pool = pool.clone();
+        let data_dir = data_dir.clone();
         std::thread::spawn(move || {
             let Ok(conn) = pool.get() else { return };
-            if let Err(e) = purge_and_clean(&conn, &data_dir(), Some(doc::TRASH_RETENTION_DAYS)) {
+            if let Err(e) = purge_and_clean(&conn, &data_dir, Some(doc::TRASH_RETENTION_DAYS)) {
                 eprintln!("[sy-notes] automatic trash cleanup failed: {e}");
             }
         });
@@ -240,6 +245,15 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Serves `<data_dir>/attachments/<file>` at attachment://localhost/<file>
+        // (http://attachment.localhost/<file> on Windows/Android).
+        .register_asynchronous_uri_scheme_protocol(attachment::URI_SCHEME, move |_ctx, request, responder| {
+            let dir = attachments_dir.clone();
+            std::thread::spawn(move || {
+                responder.respond(attachment::build_attachment_response(&dir, &request));
+            });
+        })
+        .manage(DataDir(data_dir))
         .manage(pool)
         .manage(ai_state)
         .invoke_handler(tauri::generate_handler![

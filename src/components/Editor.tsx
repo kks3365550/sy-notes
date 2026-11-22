@@ -11,6 +11,7 @@ import { useCreateBlockNote } from "@blocknote/react";
 import { BlockNoteView } from "@blocknote/mantine";
 import { DocumentItem } from "../types";
 import { saveAttachment } from "../api";
+import { resolveAttachmentUrl } from "../utils/attachmentUrl";
 import {
   AUTOSAVE_DELAY_MS,
   AutosaveGate,
@@ -200,6 +201,8 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(function Editor(
     {
       initialContent: initialBlocks,
       uploadFile: uploadFile || defaultUploadFile,
+      // Stored URL stays `attachments/<file>`; map it to the attachment:// scheme for display.
+      resolveFileUrl: resolveAttachmentUrl,
     },
     [activeDocId]
   );

@@ -18,8 +18,8 @@ jobs:
     name: Frontend (tsc, vitest, vite build)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -35,7 +35,7 @@ jobs:
     name: Rust tests (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Tauri system libraries
         run: |
           sudo apt-get update
@@ -47,21 +47,25 @@ jobs:
           workspaces: src-tauri
       # tauri-build requires frontendDist (../dist) to exist; tests don't need the real bundle.
       - run: mkdir -p dist
+      # Serial: several tests assert wall-clock latency, which parallel tests on a
+      # small shared runner distort. The whole suite still takes ~15s.
       - name: cargo test
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test -- --test-threads=1
 
   rust-windows:
     name: Rust tests (Windows / MSVC)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
       - run: mkdir dist -Force
         shell: pwsh
+      # Serial: several tests assert wall-clock latency, which parallel tests on a
+      # small shared runner distort. The whole suite still takes ~15s.
       - name: cargo test
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test -- --test-threads=1

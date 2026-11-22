@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { DocumentItem, StorageInfo } from "./types";
+import { DocumentItem, SaveError, StorageInfo } from "./types";
 
 export async function getOrCreateDaily(dateStr?: string): Promise<DocumentItem> {
   const targetDate = dateStr || new Date().toISOString().split("T")[0];
@@ -46,13 +46,32 @@ export async function getDoc(id: string): Promise<DocumentItem | null> {
   }
 }
 
+/**
+ * Saves a document. `doc.updated_at` must be the version last returned by the
+ * backend (0 to skip the optimistic-lock check). Resolves with the committed
+ * document (including its new `updated_at`).
+ *
+ * Unlike the other helpers this never swallows errors: a failed save rejects with
+ * a {@link SaveError} so the UI can show it instead of claiming "저장됨".
+ */
 export async function createOrUpdateDoc(doc: DocumentItem): Promise<DocumentItem> {
   try {
     return await invoke<DocumentItem>("create_or_update_doc", { doc });
   } catch (err) {
-    console.warn("invoke create_or_update_doc fallback:", err);
-    return doc;
+    throw toSaveError(err);
   }
+}
+
+export function toSaveError(err: unknown): SaveError {
+  if (err && typeof err === "object" && "code" in err) {
+    const e = err as Partial<SaveError>;
+    return {
+      code: e.code === "conflict" || e.code === "not_found" ? e.code : "error",
+      message: String(e.message ?? "저장 실패"),
+      actual_updated_at: e.actual_updated_at ?? null,
+    };
+  }
+  return { code: "error", message: String(err), actual_updated_at: null };
 }
 
 export async function deleteDoc(id: string): Promise<void> {
@@ -71,13 +90,19 @@ export async function restoreDoc(id: string): Promise<void> {
   }
 }
 
-export async function purgeTrash(olderThanDays = 30): Promise<number> {
-  try {
-    return await invoke<number>("purge_trash", { olderThanDays });
-  } catch (err) {
-    console.warn("invoke purge_trash fallback:", err);
-    return 0;
-  }
+export interface PurgeReport {
+  purged_docs: number;
+  removed_attachments: number;
+}
+
+/**
+ * Permanently deletes trashed documents and unreferenced attachment files.
+ * `olderThanDays = null` empties the whole trash (confirm with the user first);
+ * a number only removes documents trashed longer ago than that.
+ * Rejects on failure so the UI can report it.
+ */
+export async function purgeTrash(olderThanDays: number | null = null): Promise<PurgeReport> {
+  return await invoke<PurgeReport>("purge_trash", { olderThanDays });
 }
 
 export async function listDocs(includeDeleted = false): Promise<DocumentItem[]> {
@@ -126,4 +151,20 @@ export async function getStorageInfo(): Promise<StorageInfo> {
       is_portable: true,
     };
   }
+}
+
+export interface AiConfig {
+  /** OpenAI-compatible base URL, e.g. http://127.0.0.1:11434/v1 */
+  endpoint: string;
+  model: string;
+}
+
+/** Reads the AI server settings (persisted in the `settings` table). */
+export async function getAiConfig(): Promise<AiConfig> {
+  return await invoke<AiConfig>("get_ai_config");
+}
+
+/** Validates and persists the AI server settings. Rejects with a message on invalid input. */
+export async function setAiConfig(config: Partial<AiConfig>): Promise<void> {
+  await invoke("set_ai_config", { endpoint: config.endpoint, model: config.model });
 }

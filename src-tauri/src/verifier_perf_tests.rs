@@ -296,6 +296,12 @@ fn test_50000_char_ipc_roundtrip_latency_under_16ms() {
         current_doc = saved;
     }
 
+    // Per-stage timings so a p95 miss can be attributed to serialization
+    // or the DB. WebView/IPC transport cost is not visible here: it is the CDP
+    // benchmark total (benchmarks/measure_ipc_cdp.mjs) minus this total.
+    let mut ser_us = Vec::with_capacity(iterations);
+    let mut db_us = Vec::with_capacity(iterations);
+
     for i in 0..iterations {
         let t0 = Instant::now();
 
@@ -305,21 +311,32 @@ fn test_50000_char_ipc_roundtrip_latency_under_16ms() {
         // 2. Tauri IPC Deserialization
         let mut doc: Document = serde_json::from_str(&json_payload).expect("Deserialize from JSON");
         doc.title = format!("50,000자 대용량 성능 벤치마크 iteration {}", i);
+        let t1 = Instant::now();
 
         // 3. Backend DB Execution (upsert + FTS5 trigram update triggers)
         let saved = create_or_update_doc(&conn, &doc).expect("create_or_update_doc");
+        let t2 = Instant::now();
 
         // 4. Rust -> Frontend IPC JSON serialization
         let json_response = serde_json::to_string(&saved).expect("Serialize response");
 
         // 5. Frontend IPC response parse
         let received: Document = serde_json::from_str(&json_response).expect("Deserialize response");
+        let t3 = Instant::now();
 
-        let elapsed = t0.elapsed();
-        latencies_us.push(elapsed.as_micros());
+        latencies_us.push((t3 - t0).as_micros());
+        ser_us.push(((t1 - t0) + (t3 - t2)).as_micros());
+        db_us.push((t2 - t1).as_micros());
 
         current_doc = received;
     }
+
+    let p95_of = |v: &mut Vec<u128>| {
+        v.sort_unstable();
+        v[(v.len() as f64 * 0.95) as usize] as f64 / 1000.0
+    };
+    let ser_p95_ms = p95_of(&mut ser_us);
+    let db_p95_ms = p95_of(&mut db_us);
 
     latencies_us.sort_unstable();
 
@@ -347,6 +364,10 @@ fn test_50000_char_ipc_roundtrip_latency_under_16ms() {
     println!(" p95 Latency          : {:>10.3} ms ({:>8} us)", p95_ms, p95_us);
     println!(" p99 Latency          : {:>10.3} ms ({:>8} us)", p99_us as f64 / 1000.0, p99_us);
     println!(" Max Latency          : {:>10.3} ms ({:>8} us)", max_ms, max_us);
+    println!(" -- p95 by stage --");
+    println!("   JSON (de)serialize : {:>10.3} ms", ser_p95_ms);
+    println!("   DB upsert + FTS    : {:>10.3} ms", db_p95_ms);
+    println!("   WebView/IPC        : (CDP benchmark total - this total)");
     let threshold = if cfg!(debug_assertions) { 50.0 } else { 16.0 };
     println!(" Threshold Target     : < {:.3} ms (Release Target: < 16ms)", threshold);
     println!("=======================================================");

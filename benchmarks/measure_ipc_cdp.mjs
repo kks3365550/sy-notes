@@ -70,39 +70,45 @@ async function run() {
       // Generate 50,000 characters
       const largeText = "가나다라마바사아자차카타파하1234567890abcdefghijklmnopqrstuvwxyz!@#$%^&*()_+=".repeat(Math.ceil(textLen / 77)).slice(0, textLen);
 
+      // The backend uses optimistic locking: an update must send the
+      // updated_at the backend returned last time (0 for a new document).
+      const versions = new Map();
+      const save = async (doc) => {
+        const saved = await window.__TAURI_INTERNALS__.invoke("create_or_update_doc", {
+          doc: { ...doc, updated_at: versions.get(doc.id) ?? 0 },
+        });
+        versions.set(doc.id, saved.updated_at);
+        return saved;
+      };
+      const runId = Date.now();
+
       // Warmup 5 iterations
       for (let i = 0; i < 5; i++) {
-        if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
-          await window.__TAURI_INTERNALS__.invoke("create_or_update_doc", {
-            doc: {
-              id: "warmup-" + i,
-              title: "Warmup " + i,
-              content_json: "[]",
-              content_text: "Warmup text",
-              created_at: Date.now(),
-              updated_at: Date.now(),
-              deleted_at: null,
-              doc_type: "note"
-            }
-          });
-        }
+        await save({
+          id: "warmup-" + runId + "-" + i,
+          title: "Warmup " + i,
+          content: "[]",
+          content_text: "Warmup text",
+          created_at: Date.now(),
+          deleted_at: null,
+          doc_type: "note"
+        });
       }
 
       const timings = [];
       for (let i = 0; i < iterations; i++) {
         const docPayload = {
-          id: "ipc-bench-" + (i % 10), // reuse a few IDs to stress update
+          id: "ipc-bench-" + runId + "-" + (i % 10), // reuse a few IDs to stress update
           title: "IPC 50k Benchmark Iteration " + i,
-          content_json: "[]",
+          content: "[]",
           content_text: largeText,
           created_at: Date.now(),
-          updated_at: Date.now(),
           deleted_at: null,
           doc_type: "note"
         };
 
         const t0 = performance.now();
-        await window.__TAURI_INTERNALS__.invoke("create_or_update_doc", { doc: docPayload });
+        await save(docPayload);
         const t1 = performance.now();
         timings.push(t1 - t0);
       }
@@ -157,6 +163,10 @@ async function run() {
   console.log(`p99 latency:      ${result.p99.toFixed(2)} ms`);
   console.log(`Max latency:      ${result.max.toFixed(2)} ms`);
   console.log("=======================================================");
+
+  console.log("Backend-only breakdown (serialization vs DB):");
+  console.log("  cd src-tauri && cargo test --release --lib test_50000_char_ipc -- --nocapture");
+  console.log("  WebView/IPC transport cost = this p95 - backend p95");
 
   if (result.p95 < 16.0) {
     console.log(`[PASS] IPC round-trip p95 (${result.p95.toFixed(2)} ms) is strictly below 16ms!`);

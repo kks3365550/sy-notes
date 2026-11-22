@@ -11,6 +11,12 @@ import { useCreateBlockNote } from "@blocknote/react";
 import { BlockNoteView } from "@blocknote/mantine";
 import { DocumentItem } from "../types";
 import { saveAttachment } from "../api";
+import {
+  AUTOSAVE_DELAY_MS,
+  AutosaveGate,
+  attachCompositionListeners,
+  createAutosaveGate,
+} from "../utils/autosaveGate";
 import "@blocknote/core/fonts/inter.css";
 import "@blocknote/mantine/style.css";
 
@@ -165,10 +171,7 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(function Editor(
   const activeDocId = docProp ? docProp.id : explicitDocId;
   const activeInitialContent = docProp ? docProp.content : explicitInitialContent;
 
-  // 1. IME composition & Auto-save debounce state refs
-  const isComposingRef = useRef<boolean>(false);
-  const isDirtyRef = useRef<boolean>(false);
-  const debounceTimerRef = useRef<number | null>(null);
+  // 1. Refs
   const lastSavedJsonRef = useRef<string>(activeInitialContent || "");
   const containerRef = useRef<HTMLDivElement>(null);
   const docPropRef = useRef(docProp);
@@ -200,58 +203,46 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(function Editor(
     },
     [activeDocId]
   );
+  const editorRef = useRef(editor);
+  editorRef.current = editor;
 
-  // 3. Flush pending changes
-  const flush = useCallback(() => {
-    // Hangul IME check: ProseMirror composing or DOM isComposing
-    const pmComposing = Boolean((editor.prosemirrorView as any)?.composing);
-    if (isComposingRef.current || pmComposing) {
-      // Under Korean IME composition, flush must be suspended to prevent syllable breaking
-      return;
-    }
-
-    if (!isDirtyRef.current) {
-      return;
-    }
-
+  // 3. Save the current content (called by the autosave gate when it is safe)
+  const saveNow = useCallback(() => {
     const currentDoc = editor.document;
     const content_json = JSON.stringify(currentDoc);
     const content_text = blocksToPlainText(currentDoc);
 
     // Skip if unchanged
     if (content_json === lastSavedJsonRef.current) {
-      isDirtyRef.current = false;
+      onStatusChangeRef.current?.("saved");
       return;
     }
-
     lastSavedJsonRef.current = content_json;
-    isDirtyRef.current = false;
-
-    if (debounceTimerRef.current !== null) {
-      clearTimeout(debounceTimerRef.current);
-      debounceTimerRef.current = null;
-    }
 
     const payload: EditorSaveData = { content_json, content_text };
 
     onStatusChangeRef.current?.("saving");
 
+    let parentOwnsStatus = false;
     if (onSaveRef.current) {
       if (docPropRef.current) {
+        // Keep `updated_at` exactly as received: it is the optimistic-lock version
+        // the backend expects. The parent decides the real version at save time.
         const updatedDoc: DocumentItem = {
           ...docPropRef.current,
           content: content_json,
           content_text,
-          updated_at: Date.now(),
         };
         (onSaveRef.current as any)(updatedDoc);
+        // The parent reports "saved" / errors once the backend actually commits.
+        parentOwnsStatus = true;
       } else {
         (onSaveRef.current as any)(payload);
       }
     }
 
     onChangeRef.current?.(payload);
-    onStatusChangeRef.current?.("saved");
+    if (!parentOwnsStatus) onStatusChangeRef.current?.("saved");
 
     if (showStatusFooter) {
       setStats({
@@ -260,80 +251,47 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(function Editor(
       });
     }
   }, [editor, showStatusFooter]);
+  const saveNowRef = useRef(saveNow);
+  saveNowRef.current = saveNow;
 
-  // 4. Handle BlockNote Editor content changes
+  // 4. IME-aware autosave gate (logic lives in utils/autosaveGate.ts, unit-tested)
+  const gateRef = useRef<AutosaveGate | null>(null);
+  if (gateRef.current === null) {
+    gateRef.current = createAutosaveGate({
+      delayMs: AUTOSAVE_DELAY_MS,
+      onFlush: () => saveNowRef.current(),
+      // ProseMirror's own composing flag, in addition to composition events
+      isExternallyComposing: () => Boolean((editorRef.current.prosemirrorView as any)?.composing),
+      onPending: () => onStatusChangeRef.current?.("saving"),
+      onCompositionChange: (composing) => {
+        setComposingStatus(composing);
+        if (composing) {
+          onStatusChangeRef.current?.("composing");
+        } else if (!gateRef.current?.isDirty()) {
+          onStatusChangeRef.current?.("saved");
+        }
+        onCompositionChangeRef.current?.(composing);
+      },
+    });
+  }
+  const gate = gateRef.current;
+  const flush = useCallback(() => {
+    gate.flush();
+  }, [gate]);
+
+  // 5. BlockNote content changes -> debounce (suspended while composing)
   const handleEditorChange = useCallback(() => {
-    isDirtyRef.current = true;
-    onStatusChangeRef.current?.("saving");
+    gate.markDirty();
+  }, [gate]);
 
-    // Check if IME composition is active (DOM or ProseMirror)
-    const pmComposing = Boolean((editor.prosemirrorView as any)?.composing);
-    const isImeActive = isComposingRef.current || pmComposing;
-
-    if (isImeActive) {
-      // Requirement: compositionstart -> auto-save suspended
-      if (debounceTimerRef.current !== null) {
-        clearTimeout(debounceTimerRef.current);
-        debounceTimerRef.current = null;
-      }
-      return;
-    }
-
-    // Normal change when NOT composing: start 500ms debounce
-    if (debounceTimerRef.current !== null) {
-      clearTimeout(debounceTimerRef.current);
-    }
-    debounceTimerRef.current = window.setTimeout(() => {
-      debounceTimerRef.current = null;
-      flush();
-    }, 500);
-  }, [editor, flush]);
-
-  // 5. IME composition event listeners on container (Capture phase for 100% guarantee)
+  // 6. IME composition listeners on container (capture phase)
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
+    return attachCompositionListeners(container, gate);
+  }, [gate]);
 
-    const handleCompositionStart = () => {
-      isComposingRef.current = true;
-      setComposingStatus(true);
-      onStatusChangeRef.current?.("composing");
-      // Suspend auto-save timer immediately
-      if (debounceTimerRef.current !== null) {
-        clearTimeout(debounceTimerRef.current);
-        debounceTimerRef.current = null;
-      }
-      onCompositionChangeRef.current?.(true);
-    };
-
-    const handleCompositionEnd = () => {
-      isComposingRef.current = false;
-      setComposingStatus(false);
-      onCompositionChangeRef.current?.(false);
-
-      // Requirement: compositionend -> start 500ms debounce timer then flush
-      if (isDirtyRef.current) {
-        onStatusChangeRef.current?.("saving");
-        if (debounceTimerRef.current !== null) {
-          clearTimeout(debounceTimerRef.current);
-        }
-        debounceTimerRef.current = window.setTimeout(() => {
-          debounceTimerRef.current = null;
-          flush();
-        }, 500);
-      }
-    };
-
-    container.addEventListener("compositionstart", handleCompositionStart, true);
-    container.addEventListener("compositionend", handleCompositionEnd, true);
-
-    return () => {
-      container.removeEventListener("compositionstart", handleCompositionStart, true);
-      container.removeEventListener("compositionend", handleCompositionEnd, true);
-    };
-  }, [flush]);
-
-  // 6. External content synchronization when same doc receives updates
+  // 7. External content synchronization when same doc receives updates
   const prevDocIdRef = useRef(activeDocId);
   useEffect(() => {
     if (prevDocIdRef.current === activeDocId) {
@@ -341,8 +299,8 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(function Editor(
       if (
         activeInitialContent &&
         activeInitialContent !== lastSavedJsonRef.current &&
-        !isDirtyRef.current &&
-        !isComposingRef.current
+        !gate.isDirty() &&
+        !gate.isComposing()
       ) {
         const parsed = parseInitialBlocks(activeInitialContent);
         if (parsed) {
@@ -354,35 +312,27 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(function Editor(
       // Switched to a new document
       prevDocIdRef.current = activeDocId;
       lastSavedJsonRef.current = activeInitialContent || "";
-      isDirtyRef.current = false;
-      isComposingRef.current = false;
+      gate.reset();
       setComposingStatus(false);
     }
-  }, [activeDocId, activeInitialContent, editor]);
+  }, [activeDocId, activeInitialContent, editor, gate]);
 
-  // 7. Cleanup on unmount / doc change: flush if pending and safe
+  // 8. Cleanup on unmount: save anything unsaved (even mid-composition, the
+  // editor is going away so no syllable can be split)
   useEffect(() => {
     return () => {
-      if (debounceTimerRef.current !== null) {
-        clearTimeout(debounceTimerRef.current);
-        debounceTimerRef.current = null;
-      }
-      if (!isComposingRef.current && isDirtyRef.current) {
-        flush();
-      }
+      gate.flushOnExit();
     };
-  }, [flush]);
+  }, [gate]);
 
-  // 8. Handle container blur (flush safe changes)
+  // 9. Handle container blur (flush safe changes)
   const handleBlur = (e: React.FocusEvent<HTMLDivElement>) => {
     if (!containerRef.current?.contains(e.relatedTarget as Node)) {
-      if (!isComposingRef.current && isDirtyRef.current) {
-        flush();
-      }
+      gate.flush();
     }
   };
 
-  // 9. AI insertion support via onInsertTextRef
+  // 10. AI insertion support via onInsertTextRef
   useEffect(() => {
     if (onInsertTextRef) {
       onInsertTextRef.current = (text: string) => {
@@ -412,21 +362,21 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(function Editor(
             "after"
           );
         }
-        isDirtyRef.current = true;
-        flush();
+        gate.markDirty();
+        gate.flush();
       };
       return () => {
         onInsertTextRef.current = null;
       };
     }
-  }, [editor, onInsertTextRef, flush]);
+  }, [editor, onInsertTextRef, gate]);
 
-  // 10. Expose imperative API
+  // 11. Expose imperative API
   useImperativeHandle(
     ref,
     () => ({
       flush,
-      isComposing: () => isComposingRef.current,
+      isComposing: () => gate.isComposing(),
       getContent: () => ({
         content_json: JSON.stringify(editor.document),
         content_text: blocksToPlainText(editor.document),
@@ -458,16 +408,16 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(function Editor(
             "after"
           );
         }
-        isDirtyRef.current = true;
-        flush();
+        gate.markDirty();
+        gate.flush();
       },
       replaceBlocks: (blocks: PartialBlock[]) => {
         editor.replaceBlocks(editor.document, blocks);
-        isDirtyRef.current = true;
-        flush();
+        gate.markDirty();
+        gate.flush();
       },
     }),
-    [editor, flush]
+    [editor, flush, gate]
   );
 
   return (
@@ -495,7 +445,7 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(function Editor(
                 <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
                 한글 조합 중...
               </span>
-            ) : isDirtyRef.current ? (
+            ) : gate.isDirty() ? (
               <span className="inline-flex items-center gap-1.5 text-blue-500">
                 <span className="w-2 h-2 rounded-full bg-blue-500" />
                 저장 대기 중

@@ -93,6 +93,8 @@ npm test
 ```
 실제 한글 입력 확인은 `tests/MANUAL_IME_CHECK.md` 절차로 사람이 합니다.
 
+PR과 master 푸시마다 GitHub Actions(`.github/workflows/ci.yml`)가 프론트엔드 검사(tsc, `npm test`, vite build)와 Rust 테스트(Linux, Windows/MSVC)를 자동으로 실행합니다.
+
 ---
 
 ## 📜 라이선스 (License)

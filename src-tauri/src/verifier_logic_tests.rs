@@ -271,7 +271,7 @@ mod tests {
 
         // 4-5. Purge trash: Permanent deletion cleans up database and triggers FTS index cleanup
         delete_doc(&conn, &doc.id).expect("soft delete again");
-        let purged_count = purge_trash(&conn, 0).expect("purge all trash immediately");
+        let purged_count = purge_trash(&conn, None).expect("purge all trash immediately");
         assert_eq!(purged_count, 1, "Purged 1 trash document");
 
         let final_fts = search_docs(&conn, "검교정", 10).expect("search fts after purge");

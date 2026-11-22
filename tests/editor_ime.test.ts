@@ -1,5 +1,11 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { blocksToPlainText, parseInitialBlocks } from "../src/components/Editor";
+import {
+  AUTOSAVE_DELAY_MS,
+  AutosaveGate,
+  attachCompositionListeners,
+  createAutosaveGate,
+} from "../src/utils/autosaveGate";
 
 describe("Editor Text Extraction & Parser Tests", () => {
   it("should extract plain text from complex block structure", () => {
@@ -74,71 +80,126 @@ describe("Editor Text Extraction & Parser Tests", () => {
   });
 });
 
-describe("IME Composition & 500ms Debounce State Machine Simulation", () => {
-  it("should suspend auto-save during composition and flush after 500ms on compositionend", async () => {
-    let isComposing = false;
-    let isDirty = false;
-    let debounceTimer: any = null;
-    let saveCount = 0;
-    let savedContent = "";
+describe("IME composition autosave gate (real Editor logic)", () => {
+  // These tests drive utils/autosaveGate.ts, the exact module Editor.tsx uses,
+  // with synthetic DOM CompositionEvents. Real Korean typing in WebView2 is
+  // still a manual check (see tests/MANUAL_IME_CHECK.md).
+  let container: HTMLDivElement;
+  let saves: number;
+  let gate: AutosaveGate;
+  let detach: () => void;
+  let engineComposing: boolean;
 
-    const flush = () => {
-      if (isComposing) return; // Suspended during IME!
-      if (!isDirty) return;
-      isDirty = false;
-      saveCount++;
-      savedContent = "저장된 한글 데이터";
-    };
+  const fire = (type: "compositionstart" | "compositionend") =>
+    // Dispatched on a child so the capture-phase listener on the container is exercised.
+    container.firstElementChild!.dispatchEvent(
+      new CompositionEvent(type, { bubbles: true, data: "강" })
+    );
 
-    const onCompositionStart = () => {
-      isComposing = true;
-      if (debounceTimer) {
-        clearTimeout(debounceTimer);
-        debounceTimer = null;
-      }
-    };
+  beforeEach(() => {
+    vi.useFakeTimers();
+    container = document.createElement("div");
+    container.appendChild(document.createElement("p"));
+    document.body.appendChild(container);
+    saves = 0;
+    engineComposing = false;
+    gate = createAutosaveGate({
+      onFlush: () => saves++,
+      isExternallyComposing: () => engineComposing,
+    });
+    detach = attachCompositionListeners(container, gate);
+  });
 
-    const onContentChangeDuringIme = () => {
-      isDirty = true;
-      if (isComposing) {
-        // Auto-save MUST be suspended during composition!
-        return;
-      }
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(flush, 500);
-    };
+  afterEach(() => {
+    detach();
+    container.remove();
+    vi.useRealTimers();
+  });
 
-    const onCompositionEnd = () => {
-      isComposing = false;
-      if (isDirty) {
-        if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(flush, 500);
-      }
-    };
+  it("uses a 500ms debounce", () => {
+    expect(AUTOSAVE_DELAY_MS).toBe(500);
+  });
 
-    // 1. User starts typing Korean syllable (e.g., 'ㄱ' -> '가' -> '강')
-    onCompositionStart();
-    expect(isComposing).toBe(true);
+  it("debounces normal edits: saves once, 500ms after the last edit", () => {
+    gate.markDirty();
+    vi.advanceTimersByTime(300);
+    gate.markDirty(); // restarts the timer
+    vi.advanceTimersByTime(499);
+    expect(saves).toBe(0);
+    vi.advanceTimersByTime(1);
+    expect(saves).toBe(1);
+    expect(gate.isDirty()).toBe(false);
+  });
 
-    // 2. Typing events fire during composition
-    onContentChangeDuringIme();
-    onContentChangeDuringIme();
+  it("suspends saving during composition, then saves 500ms after compositionend", () => {
+    fire("compositionstart"); // ㄱ
+    expect(gate.isComposing()).toBe(true);
+    gate.markDirty(); // 가
+    gate.markDirty(); // 강
+    vi.advanceTimersByTime(5000);
+    expect(saves).toBe(0); // never saved mid-syllable
 
-    // 3. Verify no save occurred after 600ms while still composing
-    await new Promise((r) => setTimeout(r, 600));
-    expect(saveCount).toBe(0);
+    fire("compositionend");
+    expect(gate.isComposing()).toBe(false);
+    vi.advanceTimersByTime(499);
+    expect(saves).toBe(0);
+    vi.advanceTimersByTime(1);
+    expect(saves).toBe(1);
+  });
 
-    // 4. Syllable completes: compositionend
-    onCompositionEnd();
-    expect(isComposing).toBe(false);
+  it("cancels a pending timer when composition starts", () => {
+    gate.markDirty(); // timer armed
+    vi.advanceTimersByTime(400);
+    fire("compositionstart");
+    vi.advanceTimersByTime(1000);
+    expect(saves).toBe(0);
+    fire("compositionend");
+    vi.advanceTimersByTime(500);
+    expect(saves).toBe(1);
+  });
 
-    // 5. Verify save has not happened immediately (before 500ms)
-    await new Promise((r) => setTimeout(r, 200));
-    expect(saveCount).toBe(0);
+  it("blocks explicit flush (e.g. blur) while composing", () => {
+    fire("compositionstart");
+    gate.markDirty();
+    expect(gate.flush()).toBe(false);
+    expect(saves).toBe(0);
+    fire("compositionend");
+    expect(gate.flush()).toBe(true);
+    expect(saves).toBe(1);
+  });
 
-    // 6. Wait for 500ms debounce to complete
-    await new Promise((r) => setTimeout(r, 350));
-    expect(saveCount).toBe(1);
-    expect(savedContent).toBe("저장된 한글 데이터");
+  it("does not save after compositionend when nothing changed", () => {
+    fire("compositionstart");
+    fire("compositionend");
+    vi.advanceTimersByTime(1000);
+    expect(saves).toBe(0);
+  });
+
+  it("retries if the editor engine still reports composing after compositionend", () => {
+    fire("compositionstart");
+    gate.markDirty();
+    engineComposing = true; // ProseMirror lags behind the DOM event
+    fire("compositionend");
+    vi.advanceTimersByTime(500);
+    expect(saves).toBe(0);
+    engineComposing = false;
+    vi.advanceTimersByTime(500);
+    expect(saves).toBe(1);
+  });
+
+  it("saves unsaved edits on unmount, even mid-composition", () => {
+    fire("compositionstart");
+    gate.markDirty();
+    gate.flushOnExit();
+    expect(saves).toBe(1);
+    vi.advanceTimersByTime(1000);
+    expect(saves).toBe(1); // no duplicate save from a stale timer
+  });
+
+  it("stops reacting to composition events after detach", () => {
+    detach();
+    fire("compositionstart");
+    expect(gate.isComposing()).toBe(false);
+    detach = () => {};
   });
 });

@@ -38,13 +38,49 @@ fn get_doc(
     doc::get_doc(&conn, &id).map_err(|e| e.to_string())
 }
 
+/// Structured save error so the frontend can distinguish an optimistic-lock
+/// conflict (`code = "conflict"`) from other failures.
+#[derive(Debug, serde::Serialize)]
+pub struct SaveError {
+    pub code: &'static str,
+    pub message: String,
+    pub actual_updated_at: Option<i64>,
+}
+
+impl From<doc::DocError> for SaveError {
+    fn from(err: doc::DocError) -> Self {
+        let message = err.to_string();
+        match err {
+            doc::DocError::OptimisticLockConflict { actual, .. } => SaveError {
+                code: "conflict",
+                message,
+                actual_updated_at: actual,
+            },
+            doc::DocError::NotFound(_) => SaveError {
+                code: "not_found",
+                message,
+                actual_updated_at: None,
+            },
+            _ => SaveError {
+                code: "error",
+                message,
+                actual_updated_at: None,
+            },
+        }
+    }
+}
+
 #[tauri::command]
 fn create_or_update_doc(
     doc: doc::Document,
     state: tauri::State<'_, db::DbPool>,
-) -> Result<doc::Document, String> {
-    let conn = state.get().map_err(|e| e.to_string())?;
-    doc::create_or_update_doc(&conn, &doc).map_err(|e| e.to_string())
+) -> Result<doc::Document, SaveError> {
+    let conn = state.get().map_err(|e| SaveError {
+        code: "error",
+        message: e.to_string(),
+        actual_updated_at: None,
+    })?;
+    doc::create_or_update_doc(&conn, &doc).map_err(SaveError::from)
 }
 
 #[tauri::command]
@@ -65,13 +101,40 @@ fn restore_doc(
     doc::restore_doc(&conn, &id).map_err(|e| e.to_string())
 }
 
+/// Result of a trash purge: documents deleted and attachment files removed.
+#[derive(Debug, serde::Serialize)]
+pub struct PurgeReport {
+    pub purged_docs: usize,
+    pub removed_attachments: usize,
+}
+
+/// Purges the trash, then removes attachment files no document references.
+pub fn purge_and_clean(
+    conn: &rusqlite::Connection,
+    data_dir: &Path,
+    older_than_days: Option<u32>,
+) -> Result<PurgeReport, String> {
+    let purged_docs = doc::purge_trash(conn, older_than_days).map_err(|e| e.to_string())?;
+    let removed_attachments =
+        attachment::cleanup_orphan_attachments(conn, data_dir, attachment::ORPHAN_GRACE)?
+            .removed
+            .len();
+    Ok(PurgeReport {
+        purged_docs,
+        removed_attachments,
+    })
+}
+
+/// `older_than_days`: omitted/null empties the whole trash (UI asks for
+/// confirmation first); a number only purges documents trashed longer ago.
 #[tauri::command]
 fn purge_trash(
-    older_than_days: Option<i64>,
+    older_than_days: Option<u32>,
     state: tauri::State<'_, db::DbPool>,
-) -> Result<usize, String> {
+    data_dir: tauri::State<'_, DataDir>,
+) -> Result<PurgeReport, String> {
     let conn = state.get().map_err(|e| e.to_string())?;
-    doc::purge_trash(&conn, older_than_days.unwrap_or(30)).map_err(|e| e.to_string())
+    purge_and_clean(&conn, &data_dir.0, older_than_days)
 }
 
 #[tauri::command]
@@ -133,7 +196,8 @@ fn get_storage_info() -> db::StorageInfo {
 }
 
 /// Data directory resolved once at startup (portable `data/` or the %APPDATA% fallback),
-/// shared by attachment saving and the `attachment://` URI scheme so both always agree.
+/// shared by attachment saving, orphan cleanup and the `attachment://` URI scheme so
+/// they always agree.
 struct DataDir(PathBuf);
 
 #[tauri::command]
@@ -151,11 +215,33 @@ pub fn run() {
     let pool = db::create_pool(&db_path).expect("Failed to initialize SQLite connection pool");
     db::init_pool(&pool).expect("Failed to run database migrations");
 
-    let ai_state = ai::AiState::new();
-
     let data_dir = db_path.parent().unwrap_or(Path::new("data")).to_path_buf();
     let attachments_dir = attachment::attachments_dir(&data_dir);
     let _ = std::fs::create_dir_all(&attachments_dir);
+
+    // Automatic cleanup off the startup path: trash older than 30 days and
+    // orphaned attachment files.
+    {
+        let pool = pool.clone();
+        let data_dir = data_dir.clone();
+        std::thread::spawn(move || {
+            let Ok(conn) = pool.get() else { return };
+            if let Err(e) = purge_and_clean(&conn, &data_dir, Some(doc::TRASH_RETENTION_DAYS)) {
+                eprintln!("[sy-notes] automatic trash cleanup failed: {e}");
+            }
+        });
+    }
+
+    let ai_state = ai::AiState::new();
+    // Restore the user's AI server settings (falls back to local Ollama).
+    match pool.get() {
+        Ok(conn) => {
+            if let Err(e) = ai_state.load_from_settings(&conn) {
+                eprintln!("[sy-notes] failed to load AI settings, using defaults: {e}");
+            }
+        }
+        Err(e) => eprintln!("[sy-notes] failed to load AI settings, using defaults: {e}"),
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

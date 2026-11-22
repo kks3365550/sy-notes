@@ -262,6 +262,14 @@ pub fn create_or_update_doc(conn: &Connection, doc: &Document) -> Result<Documen
     };
 
     let expected_updated_at = doc.updated_at;
+    // Each successful update must produce a strictly newer version, even when two
+    // saves land in the same millisecond, otherwise a concurrent writer holding the
+    // previous version could pass the optimistic-lock check.
+    let new_updated_at = if expected_updated_at > 0 {
+        now.max(expected_updated_at + 1)
+    } else {
+        now
+    };
 
     // ON CONFLICT(id) DO UPDATE preserves `created_at` and checks optimistic lock on `updated_at`.
     // If expected_updated_at <= 0, optimistic check is bypassed (for initial creation or forced overwrite).
@@ -285,7 +293,7 @@ pub fn create_or_update_doc(conn: &Connection, doc: &Document) -> Result<Documen
             doc.doc_type,
             doc.date,
             insert_created_at,
-            now,
+            new_updated_at,
             doc.deleted_at,
             expected_updated_at,
         ],
@@ -387,45 +395,25 @@ pub fn restore_doc(conn: &Connection, id: &str) -> Result<(), DocError> {
     Ok(())
 }
 
-/// Purges soft-deleted documents older than `older_than_days`.
-/// If `older_than_days <= 0`, purges all soft-deleted documents immediately.
-/// Cleans up orphaned attachment files on disk if the attachments table exists.
-/// Triggers SQLite FTS deletion (`documents_ad`) via trigger on documents.
-/// Returns the number of permanently purged documents.
-pub fn purge_trash(conn: &Connection, older_than_days: i64) -> Result<usize, DocError> {
-    let cutoff = if older_than_days <= 0 {
-        unix_now() + 1000 // all soft-deleted documents
-    } else {
-        unix_now() - (older_than_days * 86_400 * 1000)
+/// Default retention for automatic trash cleanup (days).
+pub const TRASH_RETENTION_DAYS: u32 = 30;
+
+/// Permanently deletes documents from the trash.
+///
+/// - `None`: empty the whole trash (user-confirmed "영구 삭제").
+/// - `Some(n)`: only documents that have been in the trash for more than `n` days
+///   (automatic cleanup, [`TRASH_RETENTION_DAYS`]). `Some(0)` also empties the trash.
+///
+/// Live documents are never touched. FTS rows are removed by the `documents_ad`
+/// trigger. Attachment files are cleaned separately by
+/// [`crate::attachment::cleanup_orphan_attachments`], which runs after this.
+/// Returns the number of permanently deleted documents.
+pub fn purge_trash(conn: &Connection, older_than_days: Option<u32>) -> Result<usize, DocError> {
+    let cutoff = match older_than_days {
+        None | Some(0) => i64::MAX,
+        Some(days) => unix_now() - i64::from(days) * 86_400 * 1000,
     };
 
-    // Clean up physical files for attachments associated with documents being purged
-    let has_attachments: bool = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'attachments'",
-            [],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false);
-
-    if has_attachments {
-        let mut stmt = conn.prepare(
-            "SELECT file_path FROM attachments WHERE doc_id IN (
-                SELECT id FROM documents WHERE deleted_at IS NOT NULL AND deleted_at <= ?1
-            )",
-        )?;
-        let paths: Vec<String> = stmt
-            .query_map(params![cutoff], |row| row.get(0))?
-            .filter_map(Result::ok)
-            .collect();
-
-        for path in paths {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
-    // Permanently remove documents
     let count = conn.execute(
         "DELETE FROM documents WHERE deleted_at IS NOT NULL AND deleted_at <= ?1",
         params![cutoff],
@@ -768,8 +756,12 @@ mod tests {
 
         delete_doc(&conn, "doc-purge").unwrap();
 
-        // Purge with older_than_days = 0 (immediately purge all trash)
-        let purged_count = purge_trash(&conn, 0).unwrap();
+        // Retention-based purge leaves a just-deleted document alone
+        assert_eq!(purge_trash(&conn, Some(TRASH_RETENTION_DAYS)).unwrap(), 0);
+        assert!(get_doc(&conn, "doc-purge").unwrap().is_some());
+
+        // Empty the whole trash (None)
+        let purged_count = purge_trash(&conn, None).unwrap();
         assert_eq!(purged_count, 1);
 
         // Active doc still exists
@@ -779,5 +771,80 @@ mod tests {
         // Purged doc is gone
         let purged = get_doc(&conn, "doc-purge").unwrap();
         assert!(purged.is_none());
+    }
+
+    /// Regression: the frontend must send the last server-returned `updated_at` as the
+    /// expected version. Sending the client's current time (the old behaviour) must be
+    /// rejected, and chained saves using the returned version must all succeed.
+    #[test]
+    fn test_sequential_saves_with_returned_version() {
+        let conn = setup_test_db();
+        let doc = Document {
+            id: "doc-seq".to_string(),
+            title: "연속 저장".to_string(),
+            content: "v0".to_string(),
+            content_text: "v0".to_string(),
+            doc_type: "memo".to_string(),
+            date: None,
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        };
+        let mut current = create_or_update_doc(&conn, &doc).unwrap();
+
+        // Old buggy client behaviour: expected version = client "now" -> conflict, no write.
+        let mut stale = current.clone();
+        stale.content = "lost".to_string();
+        stale.updated_at = current.updated_at + 60_000;
+        assert!(matches!(
+            create_or_update_doc(&conn, &stale),
+            Err(DocError::OptimisticLockConflict { .. })
+        ));
+        assert_eq!(get_doc(&conn, "doc-seq").unwrap().unwrap().content, "v0");
+
+        // Correct flow: no sleeps, back-to-back saves within the same millisecond.
+        let mut last_version = current.updated_at;
+        for i in 1..=5 {
+            let mut next = current.clone();
+            next.content = format!("v{i}");
+            current = create_or_update_doc(&conn, &next).unwrap();
+            assert!(current.updated_at > last_version, "version must strictly increase");
+            last_version = current.updated_at;
+        }
+        assert_eq!(get_doc(&conn, "doc-seq").unwrap().unwrap().content, "v5");
+    }
+
+    #[test]
+    fn test_purge_trash_retention_only_removes_old_trash() {
+        let conn = setup_test_db();
+        let mk = |id: &str| Document {
+            id: id.to_string(),
+            title: id.to_string(),
+            content: String::new(),
+            content_text: String::new(),
+            doc_type: "memo".to_string(),
+            date: None,
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        };
+        for id in ["live", "trash-new", "trash-old"] {
+            create_or_update_doc(&conn, &mk(id)).unwrap();
+        }
+        delete_doc(&conn, "trash-new").unwrap();
+        delete_doc(&conn, "trash-old").unwrap();
+        // Pretend "trash-old" was deleted 31 days ago
+        let old = unix_now() - 31 * 86_400 * 1000;
+        conn.execute("UPDATE documents SET deleted_at = ?1 WHERE id = 'trash-old'", params![old])
+            .unwrap();
+
+        assert_eq!(purge_trash(&conn, Some(TRASH_RETENTION_DAYS)).unwrap(), 1);
+        assert!(get_doc(&conn, "trash-old").unwrap().is_none());
+        assert!(get_doc(&conn, "trash-new").unwrap().is_some());
+        assert!(get_doc(&conn, "live").unwrap().is_some());
+
+        // Emptying the trash never touches live documents
+        assert_eq!(purge_trash(&conn, None).unwrap(), 1);
+        assert!(get_doc(&conn, "live").unwrap().is_some());
     }
 }

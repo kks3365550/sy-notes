@@ -67,8 +67,11 @@ npm run tauri build
 ```powershell
 cd src-tauri
 
-# 43개 백엔드 단위/카오스/보안 테스트
+# 백엔드 단위/카오스/보안 테스트
 cargo test --lib
+
+# 50,000자 왕복 p95와 단계별 분해 (JSON 직렬화 / DB upsert+FTS)
+cargo test --release --lib test_50000_char_ipc -- --nocapture
 
 # 동시성 10,000회 락 프리 벤치마크
 cargo test --test concurrency_test -- --nocapture
@@ -76,6 +79,12 @@ cargo test --test concurrency_test -- --nocapture
 # 한국어 3자 FTS5 및 1~2자 LIKE 검색 검증
 cargo test --test fts_test
 ```
+
+```powershell
+# 프론트엔드: IME 조합 중 저장 보류 로직 (vitest + jsdom)
+npm test
+```
+실제 한글 입력 확인은 `tests/MANUAL_IME_CHECK.md` 절차로 사람이 합니다.
 
 ---
 

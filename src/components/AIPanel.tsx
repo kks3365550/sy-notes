@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
+import { getAiConfig, setAiConfig } from "../api";
 
 export interface AIPanelProps {
   /** Controls panel visibility from outside (optional) */
@@ -32,6 +33,49 @@ export function AIPanel({
   const [isCancelled, setIsCancelled] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+
+  // AI server settings (persisted via set_ai_config -> settings table)
+  const [showSettings, setShowSettings] = useState(false);
+  const [aiEndpoint, setAiEndpoint] = useState("");
+  const [aiModel, setAiModel] = useState("");
+  const [settingsMsg, setSettingsMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [isSavingSettings, setIsSavingSettings] = useState(false);
+
+  useEffect(() => {
+    if (!showSettings || !isTauri()) return;
+    let cancelled = false;
+    getAiConfig()
+      .then((cfg) => {
+        if (cancelled) return;
+        setAiEndpoint(cfg.endpoint);
+        setAiModel(cfg.model);
+      })
+      .catch((err) => !cancelled && setSettingsMsg({ ok: false, text: String(err) }));
+    return () => {
+      cancelled = true;
+    };
+  }, [showSettings]);
+
+  const handleSaveSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!isTauri()) {
+      setSettingsMsg({ ok: false, text: "데스크톱 앱에서만 저장할 수 있습니다." });
+      return;
+    }
+    setIsSavingSettings(true);
+    setSettingsMsg(null);
+    try {
+      await setAiConfig({ endpoint: aiEndpoint, model: aiModel });
+      const cfg = await getAiConfig();
+      setAiEndpoint(cfg.endpoint);
+      setAiModel(cfg.model);
+      setSettingsMsg({ ok: true, text: "저장됨 (재시작 후에도 유지)" });
+    } catch (err) {
+      setSettingsMsg({ ok: false, text: String(err) });
+    } finally {
+      setIsSavingSettings(false);
+    }
+  };
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const responseContainerRef = useRef<HTMLDivElement>(null);
@@ -298,6 +342,28 @@ export function AIPanel({
         </div>
 
         <div className="flex items-center gap-1">
+          {/* AI server settings toggle */}
+          <button
+            type="button"
+            onClick={() => {
+              setSettingsMsg(null);
+              setShowSettings((prev) => !prev);
+            }}
+            aria-expanded={showSettings}
+            className={`p-1.5 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors ${
+              showSettings ? "text-blue-500" : "text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
+            }`}
+            title="AI 서버 설정"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"
+              />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+          </button>
           {/* Close button */}
           <button
             type="button"
@@ -311,6 +377,54 @@ export function AIPanel({
           </button>
         </div>
       </div>
+
+      {/* 1-b. AI server settings */}
+      {showSettings && (
+        <form
+          onSubmit={handleSaveSettings}
+          className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 text-xs space-y-2"
+        >
+          <label className="block">
+            <span className="block mb-1 font-medium text-zinc-600 dark:text-zinc-300">
+              AI 서버 주소 (OpenAI 호환 base URL)
+            </span>
+            <input
+              type="url"
+              value={aiEndpoint}
+              onChange={(e) => setAiEndpoint(e.target.value)}
+              placeholder="http://127.0.0.1:11434/v1"
+              spellCheck={false}
+              className="w-full px-2 py-1.5 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950 font-mono"
+            />
+          </label>
+          <label className="block">
+            <span className="block mb-1 font-medium text-zinc-600 dark:text-zinc-300">모델</span>
+            <input
+              type="text"
+              value={aiModel}
+              onChange={(e) => setAiModel(e.target.value)}
+              placeholder="qwen2.5:latest"
+              spellCheck={false}
+              className="w-full px-2 py-1.5 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950 font-mono"
+            />
+          </label>
+          <div className="flex items-center justify-between gap-2">
+            <span
+              role="status"
+              className={settingsMsg?.ok ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}
+            >
+              {settingsMsg?.text}
+            </span>
+            <button
+              type="submit"
+              disabled={isSavingSettings}
+              className="px-2.5 py-1 rounded-md bg-blue-600 text-white font-medium hover:bg-blue-700 disabled:opacity-50"
+            >
+              {isSavingSettings ? "저장 중..." : "저장"}
+            </button>
+          </div>
+        </form>
+      )}
 
       {/* 2. Context Indicator (if context exists) */}
       {contextText && (

@@ -30,15 +30,14 @@ function Get-ChildPids($parentPid, $allProcs) {
 
 $descendantPids = Get-ChildPids $mainPid $allCimProcs
 
-# Also look for any msedgewebview2 instances associated with sy-notes / EBWebView data folder
-$webviewProcs = $allCimProcs | Where-Object {
-    $_.Name -like "*msedgewebview2*" -and ($_.CommandLine -like "*sy-notes*" -or $_.CommandLine -like "*EBWebView*")
-}
-$webviewPids = $webviewProcs | ForEach-Object { $_.ProcessId }
+# Also match any msedgewebview2 specifically tagged with --webview-exe-name=sy-notes.exe
+$taggedWebview = $allCimProcs | Where-Object {
+    $_.Name -like "*msedgewebview2*" -and ($_.CommandLine -like "*webview-exe-name=$ProcessName*" -or $_.CommandLine -like "*sy-notes*")
+} | ForEach-Object { $_.ProcessId }
 
-$allTargetPids = ($descendantPids + $webviewPids + $mainPid) | Select-Object -Unique
+$allTargetPids = ($descendantPids + $taggedWebview + $mainPid) | Select-Object -Unique
 
-Write-Host "Target Process PIDs in Tree: $($allTargetPids -join ', ')" -ForegroundColor Yellow
+Write-Host "Identified $($allTargetPids.Count) processes in $ProcessName tree:" -ForegroundColor Yellow
 
 $totalWS = 0
 $totalPrivate = 0

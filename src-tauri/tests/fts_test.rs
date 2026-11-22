@@ -141,6 +141,11 @@ fn test_like_fallback_1_and_2_chars() {
     create_or_update_doc(&conn, &doc_b).expect("insert doc_b");
     create_or_update_doc(&conn, &doc_c).expect("insert doc_c");
 
+    // Explicitly set updated_at timestamps to test ORDER BY updated_at DESC
+    conn.execute("UPDATE documents SET updated_at = 1000 WHERE id = 'doc-a'", []).expect("set doc_a updated_at");
+    conn.execute("UPDATE documents SET updated_at = 2000 WHERE id = 'doc-b'", []).expect("set doc_b updated_at");
+    conn.execute("UPDATE documents SET updated_at = 3000 WHERE id = 'doc-c'", []).expect("set doc_c updated_at");
+
     // 2-1. 1-character search: "검" (char_count = 1 < 3 -> LIKE fallback)
     // Matches doc_a (검교정, 점검) and doc_b (점검)
     let results_1char = search_docs(&conn, "검", 10).expect("search 1 char '검'");

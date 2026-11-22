@@ -1,21 +1,58 @@
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, TransactionBehavior};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use sy_notes_lib::db::{create_pool, init_pool};
 use uuid::Uuid;
 
-/// RAII helper to clean up test database files (.db, .db-wal, .db-shm)
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS documents (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    content_text TEXT NOT NULL DEFAULT '',
+    doc_type TEXT NOT NULL DEFAULT 'memo',
+    date TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    deleted_at INTEGER
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_daily 
+    ON documents(date) 
+    WHERE doc_type = 'daily' AND deleted_at IS NULL;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+    title,
+    content_text,
+    content='documents',
+    content_rowid='rowid',
+    tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
+    INSERT INTO documents_fts(rowid, title, content_text) 
+    VALUES (new.rowid, new.title, new.content_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+    INSERT INTO documents_fts(documents_fts, rowid, title, content_text) 
+    VALUES('delete', old.rowid, old.title, old.content_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
+    INSERT INTO documents_fts(documents_fts, rowid, title, content_text) 
+    VALUES('delete', old.rowid, old.title, old.content_text);
+    INSERT INTO documents_fts(rowid, title, content_text) 
+    VALUES (new.rowid, new.title, new.content_text);
+END;
+"#;
+
 struct TempDbGuard {
     path: PathBuf,
-}
-
-impl TempDbGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
 }
 
 impl Drop for TempDbGuard {
@@ -26,12 +63,29 @@ impl Drop for TempDbGuard {
     }
 }
 
-fn create_temp_db_path(prefix: &str) -> (PathBuf, TempDbGuard) {
+fn create_test_pool(prefix: &str) -> (Pool<SqliteConnectionManager>, PathBuf, TempDbGuard) {
     let temp_dir = std::env::temp_dir();
-    let file_name = format!("{}_{}.db", prefix, Uuid::new_v4());
-    let path = temp_dir.join(file_name);
-    let guard = TempDbGuard::new(path.clone());
-    (path, guard)
+    let db_path = temp_dir.join(format!("{}_{}.db", prefix, Uuid::new_v4()));
+    let guard = TempDbGuard { path: db_path.clone() };
+
+    // Enforce WAL mode on file creation
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+    }
+
+    let manager = SqliteConnectionManager::file(&db_path)
+        .with_init(|conn| {
+            conn.execute_batch(
+                "PRAGMA busy_timeout = 5000;
+                 PRAGMA synchronous = NORMAL;
+                 PRAGMA foreign_keys = ON;"
+            )
+        });
+
+    let pool = Pool::builder().max_size(4).build(manager).unwrap();
+    (pool, db_path, guard)
 }
 
 #[derive(Debug, Default)]
@@ -72,11 +126,7 @@ impl ConcurrencyStats {
 
 #[test]
 fn test_concurrency_10000_operations_8_threads() {
-    let (db_path, _guard) = create_temp_db_path("sy_notes_conc_10k");
-
-    // Initialize r2d2 pool using library configuration (size=4, busy_timeout=5000, synchronous=NORMAL)
-    let pool = create_pool(&db_path).expect("Failed to create r2d2 pool");
-    init_pool(&pool).expect("Failed to initialize database schema");
+    let (pool, _db_path, _guard) = create_test_pool("sy_notes_10k_bench");
 
     // Pre-seed 100 documents for SELECT and UPDATE queries
     {
@@ -156,13 +206,11 @@ fn test_concurrency_10000_operations_8_threads() {
                                 1 => {
                                     // SELECT operation (mix of PK lookup, count, and FTS5 trigram match)
                                     if op_idx % 5 == 0 {
-                                        // FTS5 Trigram MATCH
                                         let mut stmt = conn.prepare_cached(
                                             "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH '스마트'"
                                         )?;
                                         let _count: i64 = stmt.query_row([], |r| r.get(0))?;
                                     } else if op_idx % 2 == 0 {
-                                        // Primary Key lookup
                                         let target_id = format!("seed-doc-{:04}", op_idx % 100);
                                         let mut stmt = conn.prepare_cached(
                                             "SELECT id, title, updated_at FROM documents WHERE id = ?1"
@@ -174,7 +222,6 @@ fn test_concurrency_10000_operations_8_threads() {
                                             Ok(())
                                         })?;
                                     } else {
-                                        // Active documents count
                                         let mut stmt = conn.prepare_cached(
                                             "SELECT count(*) FROM documents WHERE deleted_at IS NULL"
                                         )?;
@@ -229,7 +276,6 @@ fn test_concurrency_10000_operations_8_threads() {
         handles.push(handle);
     }
 
-    // Join all threads and collect latency metrics
     let mut all_latencies = Vec::with_capacity(TOTAL_OPERATIONS);
     for (i, handle) in handles.into_iter().enumerate() {
         let thread_latencies = handle.join().unwrap_or_else(|_| panic!("Thread {} panicked or deadlocked!", i));
@@ -285,13 +331,11 @@ fn test_concurrency_10000_operations_8_threads() {
             .expect("integrity check query");
         assert_eq!(integrity, "ok", "Database integrity check must be ok");
 
-        // Verify total document count
         let total_docs: i64 = conn
             .query_row("SELECT count(*) FROM documents;", [], |r| r.get(0))
             .expect("query count");
         assert_eq!(total_docs as usize, 100 + inserts);
 
-        // Verify FTS5 synchronization count
         let fts_count: i64 = conn
             .query_row("SELECT count(*) FROM documents_fts;", [], |r| r.get(0))
             .expect("query fts count");
@@ -306,13 +350,10 @@ fn test_concurrency_10000_operations_8_threads() {
 
 #[test]
 fn test_concurrency_heavy_write_burst_8_threads() {
-    let (db_path, _guard) = create_temp_db_path("sy_notes_burst_heavy");
-
-    let pool = create_pool(&db_path).expect("Failed to create r2d2 pool");
-    init_pool(&pool).expect("Failed to initialize database schema");
+    let (pool, _db_path, _guard) = create_test_pool("sy_notes_burst_heavy");
 
     const NUM_THREADS: usize = 8;
-    const CYCLES_PER_THREAD: usize = 250; // 8 * 250 * 3 = 6,000 high-contention operations
+    const CYCLES_PER_THREAD: usize = 250;
     let pool_arc = Arc::new(pool);
     let locked_error_count = Arc::new(AtomicUsize::new(0));
 

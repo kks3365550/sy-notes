@@ -27,6 +27,15 @@ fn setup_portable_env() {
             std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", path);
         }
     }
+
+    if std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").is_err() {
+        unsafe {
+            std::env::set_var(
+                "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+                "--in-process-gpu --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,NetworkServiceSandbox,SpareRenderer --renderer-process-limit=1 --js-flags=--max-old-space-size=64",
+            );
+        }
+    }
 }
 
 fn fallback_appdata_dir() -> Option<PathBuf> {

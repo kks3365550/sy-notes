@@ -262,6 +262,14 @@ pub fn create_or_update_doc(conn: &Connection, doc: &Document) -> Result<Documen
     };
 
     let expected_updated_at = doc.updated_at;
+    // Each successful update must produce a strictly newer version, even when two
+    // saves land in the same millisecond, otherwise a concurrent writer holding the
+    // previous version could pass the optimistic-lock check.
+    let new_updated_at = if expected_updated_at > 0 {
+        now.max(expected_updated_at + 1)
+    } else {
+        now
+    };
 
     // ON CONFLICT(id) DO UPDATE preserves `created_at` and checks optimistic lock on `updated_at`.
     // If expected_updated_at <= 0, optimistic check is bypassed (for initial creation or forced overwrite).
@@ -285,7 +293,7 @@ pub fn create_or_update_doc(conn: &Connection, doc: &Document) -> Result<Documen
             doc.doc_type,
             doc.date,
             insert_created_at,
-            now,
+            new_updated_at,
             doc.deleted_at,
             expected_updated_at,
         ],
@@ -779,5 +787,46 @@ mod tests {
         // Purged doc is gone
         let purged = get_doc(&conn, "doc-purge").unwrap();
         assert!(purged.is_none());
+    }
+
+    /// Regression: the frontend must send the last server-returned `updated_at` as the
+    /// expected version. Sending the client's current time (the old behaviour) must be
+    /// rejected, and chained saves using the returned version must all succeed.
+    #[test]
+    fn test_sequential_saves_with_returned_version() {
+        let conn = setup_test_db();
+        let doc = Document {
+            id: "doc-seq".to_string(),
+            title: "연속 저장".to_string(),
+            content: "v0".to_string(),
+            content_text: "v0".to_string(),
+            doc_type: "memo".to_string(),
+            date: None,
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        };
+        let mut current = create_or_update_doc(&conn, &doc).unwrap();
+
+        // Old buggy client behaviour: expected version = client "now" -> conflict, no write.
+        let mut stale = current.clone();
+        stale.content = "lost".to_string();
+        stale.updated_at = current.updated_at + 60_000;
+        assert!(matches!(
+            create_or_update_doc(&conn, &stale),
+            Err(DocError::OptimisticLockConflict { .. })
+        ));
+        assert_eq!(get_doc(&conn, "doc-seq").unwrap().unwrap().content, "v0");
+
+        // Correct flow: no sleeps, back-to-back saves within the same millisecond.
+        let mut last_version = current.updated_at;
+        for i in 1..=5 {
+            let mut next = current.clone();
+            next.content = format!("v{i}");
+            current = create_or_update_doc(&conn, &next).unwrap();
+            assert!(current.updated_at > last_version, "version must strictly increase");
+            last_version = current.updated_at;
+        }
+        assert_eq!(get_doc(&conn, "doc-seq").unwrap().unwrap().content, "v5");
     }
 }

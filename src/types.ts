@@ -16,4 +16,11 @@ export interface StorageInfo {
   is_portable: boolean;
 }
 
+/** Error returned by the `create_or_update_doc` command. */
+export interface SaveError {
+  code: "conflict" | "not_found" | "error";
+  message: string;
+  actual_updated_at: number | null;
+}
+
 export type ThemeMode = "light" | "dark";

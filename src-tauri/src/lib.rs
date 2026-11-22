@@ -38,13 +38,49 @@ fn get_doc(
     doc::get_doc(&conn, &id).map_err(|e| e.to_string())
 }
 
+/// Structured save error so the frontend can distinguish an optimistic-lock
+/// conflict (`code = "conflict"`) from other failures.
+#[derive(Debug, serde::Serialize)]
+pub struct SaveError {
+    pub code: &'static str,
+    pub message: String,
+    pub actual_updated_at: Option<i64>,
+}
+
+impl From<doc::DocError> for SaveError {
+    fn from(err: doc::DocError) -> Self {
+        let message = err.to_string();
+        match err {
+            doc::DocError::OptimisticLockConflict { actual, .. } => SaveError {
+                code: "conflict",
+                message,
+                actual_updated_at: actual,
+            },
+            doc::DocError::NotFound(_) => SaveError {
+                code: "not_found",
+                message,
+                actual_updated_at: None,
+            },
+            _ => SaveError {
+                code: "error",
+                message,
+                actual_updated_at: None,
+            },
+        }
+    }
+}
+
 #[tauri::command]
 fn create_or_update_doc(
     doc: doc::Document,
     state: tauri::State<'_, db::DbPool>,
-) -> Result<doc::Document, String> {
-    let conn = state.get().map_err(|e| e.to_string())?;
-    doc::create_or_update_doc(&conn, &doc).map_err(|e| e.to_string())
+) -> Result<doc::Document, SaveError> {
+    let conn = state.get().map_err(|e| SaveError {
+        code: "error",
+        message: e.to_string(),
+        actual_updated_at: None,
+    })?;
+    doc::create_or_update_doc(&conn, &doc).map_err(SaveError::from)
 }
 
 #[tauri::command]

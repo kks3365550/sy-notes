@@ -236,22 +236,26 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(function Editor(
 
     onStatusChangeRef.current?.("saving");
 
+    let parentOwnsStatus = false;
     if (onSaveRef.current) {
       if (docPropRef.current) {
+        // Keep `updated_at` exactly as received: it is the optimistic-lock version
+        // the backend expects. The parent decides the real version at save time.
         const updatedDoc: DocumentItem = {
           ...docPropRef.current,
           content: content_json,
           content_text,
-          updated_at: Date.now(),
         };
         (onSaveRef.current as any)(updatedDoc);
+        // The parent reports "saved" / errors once the backend actually commits.
+        parentOwnsStatus = true;
       } else {
         (onSaveRef.current as any)(payload);
       }
     }
 
     onChangeRef.current?.(payload);
-    onStatusChangeRef.current?.("saved");
+    if (!parentOwnsStatus) onStatusChangeRef.current?.("saved");
 
     if (showStatusFooter) {
       setStats({

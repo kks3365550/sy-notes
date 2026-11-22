@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { DocumentItem, StorageInfo } from "./types";
+import { DocumentItem, SaveError, StorageInfo } from "./types";
 
 export async function getOrCreateDaily(dateStr?: string): Promise<DocumentItem> {
   const targetDate = dateStr || new Date().toISOString().split("T")[0];
@@ -46,13 +46,32 @@ export async function getDoc(id: string): Promise<DocumentItem | null> {
   }
 }
 
+/**
+ * Saves a document. `doc.updated_at` must be the version last returned by the
+ * backend (0 to skip the optimistic-lock check). Resolves with the committed
+ * document (including its new `updated_at`).
+ *
+ * Unlike the other helpers this never swallows errors: a failed save rejects with
+ * a {@link SaveError} so the UI can show it instead of claiming "저장됨".
+ */
 export async function createOrUpdateDoc(doc: DocumentItem): Promise<DocumentItem> {
   try {
     return await invoke<DocumentItem>("create_or_update_doc", { doc });
   } catch (err) {
-    console.warn("invoke create_or_update_doc fallback:", err);
-    return doc;
+    throw toSaveError(err);
   }
+}
+
+export function toSaveError(err: unknown): SaveError {
+  if (err && typeof err === "object" && "code" in err) {
+    const e = err as Partial<SaveError>;
+    return {
+      code: e.code === "conflict" || e.code === "not_found" ? e.code : "error",
+      message: String(e.message ?? "저장 실패"),
+      actual_updated_at: e.actual_updated_at ?? null,
+    };
+  }
+  return { code: "error", message: String(err), actual_updated_at: null };
 }
 
 export async function deleteDoc(id: string): Promise<void> {

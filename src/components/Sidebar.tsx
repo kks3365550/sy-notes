@@ -146,7 +146,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         content_text: "",
         doc_type: "memo",
         created_at: now,
-        updated_at: now,
+        updated_at: 0, // new document: no prior version to check against
         deleted_at: null,
       };
 

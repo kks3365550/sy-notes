@@ -4,10 +4,19 @@ use chrono::Utc;
 use rusqlite::{params, TransactionBehavior};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 use uuid::Uuid;
+
+/// The benchmarks in this module measure wall-clock latency, so they must not run
+/// at the same time as each other: the 8-thread concurrency benchmark saturates CPU
+/// and disk and pushed the 50,000-char p95 from ~13ms to ~99ms on a CI runner.
+static BENCH_LOCK: Mutex<()> = Mutex::new(());
+
+fn bench_guard() -> std::sync::MutexGuard<'static, ()> {
+    BENCH_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// RAII helper to clean up test database files (.db, .db-wal, .db-shm)
 struct TempDbGuard(PathBuf);
@@ -30,6 +39,7 @@ fn create_temp_db_path(prefix: &str) -> (PathBuf, TempDbGuard) {
 
 #[test]
 fn test_concurrency_8_threads_10000_operations_zero_locked() {
+    let _bench = bench_guard();
     let (db_path, _guard) = create_temp_db_path("perf_conc_10k");
 
     // Initialize r2d2 pool using library configuration (size=4, busy_timeout=5000, synchronous=NORMAL)
@@ -255,6 +265,7 @@ fn test_concurrency_8_threads_10000_operations_zero_locked() {
 
 #[test]
 fn test_50000_char_ipc_roundtrip_latency_under_16ms() {
+    let _bench = bench_guard();
     let (db_path, _guard) = create_temp_db_path("perf_ipc_50k");
 
     let pool = create_pool(&db_path).expect("Create db pool");

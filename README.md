@@ -70,6 +70,9 @@ cd src-tauri
 # 백엔드 단위/카오스/보안 테스트
 cargo test --lib
 
+# 50,000자 왕복 p95와 단계별 분해 (JSON 직렬화 / DB upsert+FTS)
+cargo test --release --lib test_50000_char_ipc -- --nocapture
+
 # 동시성 10,000회 락 프리 벤치마크
 cargo test --test concurrency_test -- --nocapture
 

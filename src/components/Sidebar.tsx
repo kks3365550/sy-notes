@@ -286,7 +286,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </h1>
           </div>
           <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400">
-            v0.1
+            v1.1
           </span>
         </div>
 

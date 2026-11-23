@@ -141,6 +141,31 @@ export async function saveAttachment(fileName: string, dataBase64: string): Prom
   }
 }
 
+export interface BackupReport {
+  daily_path: string;
+  weekly_path: string | null;
+  bytes_copied: number;
+}
+
+export interface ExportReport {
+  export_path: string;
+  total_exported: number;
+  active_count: number;
+  trash_count: number;
+  attachments_count: number;
+  zip_bytes: number;
+}
+
+/** Creates a rotating DB snapshot now (7 daily + 4 weekly). Rejects on failure. */
+export async function backupDb(): Promise<BackupReport> {
+  return await invoke<BackupReport>("backup_db", { backupDir: null });
+}
+
+/** Exports every document and attachment to a ZIP under data/exports. Rejects on failure. */
+export async function exportAll(): Promise<ExportReport> {
+  return await invoke<ExportReport>("export_all", { exportPath: null });
+}
+
 export async function getStorageInfo(): Promise<StorageInfo> {
   try {
     return await invoke<StorageInfo>("get_storage_info");

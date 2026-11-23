@@ -9,6 +9,8 @@ import {
   restoreDoc,
   purgeTrash,
   getStorageInfo,
+  backupDb,
+  exportAll,
 } from "../api";
 
 export interface SidebarProps {
@@ -219,6 +221,31 @@ export const Sidebar: React.FC<SidebarProps> = ({
     } catch (err) {
       console.error("Failed to purge trash:", err);
       window.alert(`휴지통 비우기에 실패했습니다: ${String(err)}`);
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
+
+  // 6. 백업 / ZIP 내보내기 핸들러
+  const handleBackup = async () => {
+    setActionLoadingId("backup");
+    try {
+      const r = await backupDb();
+      window.alert(`백업을 만들었습니다.\n${r.daily_path}`);
+    } catch (err) {
+      window.alert(`백업에 실패했습니다: ${String(err)}`);
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
+
+  const handleExport = async () => {
+    setActionLoadingId("export");
+    try {
+      const r = await exportAll();
+      window.alert(`문서 ${r.total_exported}개를 내보냈습니다.\n${r.export_path}`);
+    } catch (err) {
+      window.alert(`내보내기에 실패했습니다: ${String(err)}`);
     } finally {
       setActionLoadingId(null);
     }
@@ -555,6 +582,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
       {/* 4. Footer */}
       <div className="p-2 border-t border-slate-200 dark:border-zinc-800 text-[11px] text-slate-400 dark:text-zinc-500 flex items-center justify-between">
         <span>총 {docs.length}개 메모</span>
+        <button
+          type="button"
+          onClick={handleBackup}
+          disabled={actionLoadingId === "backup"}
+          className="hover:text-slate-600 dark:hover:text-zinc-300"
+          title="지금 DB 백업 (일 7개·주 4개 회전)"
+        >
+          백업
+        </button>
+        <button
+          type="button"
+          onClick={handleExport}
+          disabled={actionLoadingId === "export"}
+          className="hover:text-slate-600 dark:hover:text-zinc-300"
+          title="모든 문서·첨부를 ZIP으로 내보내기"
+        >
+          내보내기
+        </button>
         <button
           type="button"
           onClick={loadDocuments}

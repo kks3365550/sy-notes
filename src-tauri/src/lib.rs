@@ -183,11 +183,31 @@ fn backup_db(
 
 #[tauri::command]
 fn export_all(
-    export_path: String,
+    export_path: Option<String>,
     state: tauri::State<'_, db::DbPool>,
 ) -> Result<backup::ExportReport, String> {
     let conn = state.get().map_err(|e| e.to_string())?;
-    backup::export_all(&conn, &export_path).map_err(|e| e.to_string())
+    let path = match export_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let db_path = db::get_default_db_path();
+            let parent = db_path.parent().unwrap_or(Path::new("."));
+            let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            parent.join("exports").join(format!("sy-notes_export_{stamp}.zip"))
+        }
+    };
+    backup::export_all(&conn, &path).map_err(|e| e.to_string())
+}
+
+/// True when `dir` already holds a `daily_<today>_*.db` snapshot.
+fn has_backup_today(dir: &Path) -> bool {
+    let prefix = format!("daily_{}_", chrono::Local::now().format("%Y%m%d"));
+    std::fs::read_dir(dir)
+        .map(|it| {
+            it.flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        })
+        .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -228,6 +248,13 @@ pub fn run() {
             let Ok(conn) = pool.get() else { return };
             if let Err(e) = purge_and_clean(&conn, &data_dir, Some(doc::TRASH_RETENTION_DAYS)) {
                 eprintln!("[sy-notes] automatic trash cleanup failed: {e}");
+            }
+            // Automatic rotating backup, at most one snapshot per day.
+            let backup_dir = data_dir.join("backups");
+            if !has_backup_today(&backup_dir) {
+                if let Err(e) = backup::backup_db(&conn, &backup_dir) {
+                    eprintln!("[sy-notes] automatic backup failed: {e}");
+                }
             }
         });
     }
